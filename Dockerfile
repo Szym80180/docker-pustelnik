@@ -1,23 +1,21 @@
+# syntax=docker/dockerfile:1.4
 # ==============================================================================
 # Dockerfile for NVIDIA Jetson Orin Nano (ARM64) - Autonomous Rover
 # Target Platform: Jetpack 6.2 (L4T R36.x / Ubuntu 22.04 Jammy)
 # Compute Capability: 8.7 (NVIDIA Jetson Orin)
 # ROS2 Distribution: Humble Hawksbill
+# Optimized with Multi-Stage Build, BuildKit APT/CCache Caching & Ninja
 # ==============================================================================
 
-# ------------------------------------------------------------------------------
-# 1. Base Image selection
-# ------------------------------------------------------------------------------
-# JetPack 6.2 corresponds to L4T R36.x (Ubuntu 22.04 LTS ARM64)
-# Primary: nvcr.io/nvidia/l4t-jetpack:r36.3.0 (or r36.2.0)
-# Alternative / Fallback: dustynv/ros:humble-ros-base-l4t-r36.2.0
 ARG BASE_IMAGE=nvcr.io/nvidia/l4t-jetpack:r36.3.0
-FROM ${BASE_IMAGE}
+
+# ------------------------------------------------------------------------------
+# STAGE 1: Builder Stage (Compiles OpenCV, GTSAM, RTAB-Map, librealsense2)
+# ------------------------------------------------------------------------------
+FROM ${BASE_IMAGE} AS builder
 
 LABEL maintainer="Autonomous Rover Team"
-LABEL description="Optimized ROS2 Humble CUDA-accelerated image for Jetson Orin Nano"
 
-# Set environment variables
 ENV DEBIAN_FRONTEND=noninteractive \
     LANG=en_US.UTF-8 \
     LC_ALL=en_US.UTF-8 \
@@ -27,23 +25,20 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PATH=/usr/local/cuda/bin:${PATH} \
     LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH} \
     TORCH_CUDA_ARCH_LIST="8.7" \
-    CUDA_ARCH_BIN="8.7"
+    CUDA_ARCH_BIN="8.7" \
+    CCACHE_DIR=/root/.cache/ccache
 
 SHELL ["/bin/bash", "-c"]
 
-# Set locale
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# Set locale & Core Build Tools (including ccache and ninja)
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends \
     locales \
-    && locale-gen en_US.UTF-8 \
-    && update-locale LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8 \
-    && rm -rf /var/lib/apt/lists/*
-
-# ------------------------------------------------------------------------------
-# Core Build Dependencies & Tools Setup
-# ------------------------------------------------------------------------------
-RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     cmake \
+    ninja-build \
+    ccache \
     git \
     wget \
     curl \
@@ -63,31 +58,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libusb-1.0-0-dev \
     libssl-dev \
     libudev-dev \
-    && rm -rf /var/lib/apt/lists/*
-
-# ------------------------------------------------------------------------------
-# 2. Core ROS2 Humble Setup
-# ------------------------------------------------------------------------------
-RUN curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key -o /usr/share/keyrings/ros-archive-keyring.gpg && \
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] http://packages.ros.org/ros2/ubuntu $(lsb_release -cs) main" | tee /etc/apt/sources.list.d/ros2.list > /dev/null && \
-    apt-get update && apt-get install -y --no-install-recommends \
-    ros-humble-ros-base \
-    ros-dev-tools \
-    python3-colcon-common-extensions \
-    python3-rosdep \
-    python3-vcstool \
-    python3-argcomplete \
-    && rosdep init || true \
-    && rosdep update \
-    && rm -rf /var/lib/apt/lists/*
-
-# ------------------------------------------------------------------------------
-# 3. CUDA-enabled OpenCV (Compiled from Source for Jetson Orin Compute Capability 8.7)
-# ------------------------------------------------------------------------------
-ENV OPENCV_VERSION=4.8.0
-
-# Install OpenCV pre-requisites and image/video I/O libraries
-RUN apt-get update && apt-get install -y --no-install-recommends \
     libjpeg-dev \
     libpng-dev \
     libtiff-dev \
@@ -100,15 +70,48 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgtk-3-dev \
     libatlas-base-dev \
     gfortran \
-    && rm -rf /var/lib/apt/lists/*
+    libpcl-dev \
+    liboctomap-dev \
+    libsqlite3-dev \
+    libfreenect-dev \
+    libopenni2-dev \
+    && locale-gen en_US.UTF-8 \
+    && update-locale LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8
 
-RUN cd /tmp && \
+# Setup ROS2 Repo and ROS Core build dependencies
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key -o /usr/share/keyrings/ros-archive-keyring.gpg && \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] http://packages.ros.org/ros2/ubuntu $(lsb_release -cs) main" | tee /etc/apt/sources.list.d/ros2.list > /dev/null && \
+    apt-get update && apt-get install -y --no-install-recommends \
+    ros-humble-ros-base \
+    ros-dev-tools \
+    python3-colcon-common-extensions \
+    python3-rosdep \
+    python3-vcstool \
+    ros-humble-cv-bridge \
+    ros-humble-image-transport \
+    ros-humble-tf2 \
+    ros-humble-tf2-ros \
+    ros-humble-tf2-eigen \
+    ros-humble-laser-geometry \
+    ros-humble-pcl-conversions \
+    ros-humble-pcl-ros \
+    ros-humble-octomap-msgs \
+    ros-humble-grid-map-ros
+
+# 1. Compile CUDA-enabled OpenCV 4.8.0 with Ninja and CCache
+ENV OPENCV_VERSION=4.8.0
+RUN --mount=type=cache,target=/root/.cache/ccache \
+    cd /tmp && \
     git clone --depth 1 --branch ${OPENCV_VERSION} https://github.com/opencv/opencv.git && \
     git clone --depth 1 --branch ${OPENCV_VERSION} https://github.com/opencv/opencv_contrib.git && \
     mkdir -p opencv/build && cd opencv/build && \
-    cmake \
+    cmake -G Ninja \
+        -D CMAKE_C_COMPILER_LAUNCHER=ccache \
+        -D CMAKE_CXX_COMPILER_LAUNCHER=ccache \
         -D CMAKE_BUILD_TYPE=RELEASE \
-        -D CMAKE_INSTALL_PREFIX=/usr/local \
+        -D CMAKE_INSTALL_PREFIX=/opt/rover/deps \
         -D OPENCV_EXTRA_MODULES_PATH=/tmp/opencv_contrib/modules \
         -D WITH_CUDA=ON \
         -D WITH_CUDNN=ON \
@@ -127,23 +130,141 @@ RUN cd /tmp && \
         -D BUILD_opencv_python3=ON \
         -D PYTHON3_EXECUTABLE=$(which python3) \
         -D PYTHON3_INCLUDE_DIR=$(python3 -c "import sysconfig; print(sysconfig.get_path('include'))") \
-        -D PYTHON3_PACKAGES_PATH=$(python3 -c "import site; print(site.getsitepackages()[0])") \
+        -D PYTHON3_PACKAGES_PATH=/opt/rover/deps/lib/python3.10/site-packages \
         .. && \
-    make -j$(nproc) && \
-    make install && \
-    ldconfig && \
+    ninja install && \
     rm -rf /tmp/opencv /tmp/opencv_contrib
 
+# 2. Compile GTSAM with Ninja and CCache
+RUN --mount=type=cache,target=/root/.cache/ccache \
+    cd /tmp && \
+    git clone --depth 1 --branch 4.2a0 https://github.com/borglab/gtsam.git gtsam && \
+    mkdir -p gtsam/build && cd gtsam/build && \
+    cmake -G Ninja \
+        -D CMAKE_C_COMPILER_LAUNCHER=ccache \
+        -D CMAKE_CXX_COMPILER_LAUNCHER=ccache \
+        -D CMAKE_BUILD_TYPE=Release \
+        -D CMAKE_INSTALL_PREFIX=/opt/rover/deps \
+        -D GTSAM_BUILD_WITH_MARCH_NATIVE=OFF \
+        -D GTSAM_USE_SYSTEM_EIGEN=ON \
+        -D GTSAM_BUILD_EXAMPLES_ALWAYS=OFF \
+        -D GTSAM_BUILD_TESTS=OFF \
+        .. && \
+    ninja install && \
+    rm -rf /tmp/gtsam
+
+# 3. Compile CUDA-enabled RTAB-Map
+RUN --mount=type=cache,target=/root/.cache/ccache \
+    cd /tmp && \
+    git clone --depth 1 --branch master https://github.com/introlab/rtabmap.git rtabmap && \
+    mkdir -p rtabmap/build && cd rtabmap/build && \
+    cmake -G Ninja \
+        -D CMAKE_C_COMPILER_LAUNCHER=ccache \
+        -D CMAKE_CXX_COMPILER_LAUNCHER=ccache \
+        -D CMAKE_BUILD_TYPE=Release \
+        -D CMAKE_INSTALL_PREFIX=/opt/rover/deps \
+        -D GTSAM_DIR=/opt/rover/deps/lib/cmake/GTSAM \
+        -D OpenCV_DIR=/opt/rover/deps/lib/cmake/opencv4 \
+        -D WITH_CUDA=ON \
+        -D CUDA_ARCH_BIN=8.7 \
+        -D WITH_QT=OFF \
+        -D WITH_PYTHON=ON \
+        -D WITH_GTSAM=ON \
+        -D WITH_OCTOMAP=ON \
+        .. && \
+    ninja install && \
+    rm -rf /tmp/rtabmap
+
+# 4. Compile librealsense2 with RSUSB backend
+ENV REALSENSE_VERSION=2.54.2
+RUN --mount=type=cache,target=/root/.cache/ccache \
+    cd /tmp && \
+    git clone --depth 1 --branch v${REALSENSE_VERSION} https://github.com/IntelRealSense/librealsense.git && \
+    mkdir -p librealsense/build && cd librealsense/build && \
+    cmake -G Ninja \
+        -D CMAKE_C_COMPILER_LAUNCHER=ccache \
+        -D CMAKE_CXX_COMPILER_LAUNCHER=ccache \
+        -D CMAKE_BUILD_TYPE=Release \
+        -D CMAKE_INSTALL_PREFIX=/opt/rover/deps \
+        -D FORCE_RSUSB_BACKEND=ON \
+        -D BUILD_PYTHON_BINDINGS:bool=true \
+        -D BUILD_EXAMPLES=OFF \
+        -D BUILD_GRAPHICAL_EXAMPLES=OFF \
+        .. && \
+    ninja install && \
+    rm -rf /tmp/librealsense
+
+# 5. Compile rtabmap_ros in workspace
+RUN --mount=type=cache,target=/root/.cache/ccache \
+    mkdir -p /ros2_ws/src && cd /ros2_ws/src && \
+    git clone --depth 1 --branch humble-devel https://github.com/introlab/rtabmap_ros.git && \
+    cd /ros2_ws && \
+    source /opt/ros/humble/setup.bash && \
+    export CMAKE_PREFIX_PATH=/opt/rover/deps:${CMAKE_PREFIX_PATH} && \
+    colcon build --cmake-args \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_PREFIX_PATH=/opt/rover/deps \
+        -DGTSAM_DIR=/opt/rover/deps/lib/cmake/GTSAM \
+        -DRTABMap_DIR=/opt/rover/deps/lib/cmake/RTABMap \
+        -DOpenCV_DIR=/opt/rover/deps/lib/cmake/opencv4 && \
+    rm -rf /ros2_ws/build /ros2_ws/log
+
+
 # ------------------------------------------------------------------------------
-# 4. CUDA-enabled RTAB-Map & rtabmap_ros (Compiled with CUDA acceleration)
+# STAGE 2: Final Minimal Runtime Image
 # ------------------------------------------------------------------------------
-# Install RTAB-Map dependencies available in Ubuntu 22.04 & ROS2 Humble
+FROM ${BASE_IMAGE} AS runtime
+
+LABEL maintainer="Autonomous Rover Team"
+LABEL description="Optimized ROS2 Humble CUDA-accelerated image for Jetson Orin Nano"
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    LANG=en_US.UTF-8 \
+    LC_ALL=en_US.UTF-8 \
+    ROS_DISTRO=humble \
+    ROS_ROOT=/opt/ros/humble \
+    CUDA_HOME=/usr/local/cuda \
+    PATH=/usr/local/cuda/bin:/opt/rover/deps/bin:${PATH} \
+    LD_LIBRARY_PATH=/usr/local/cuda/lib64:/opt/rover/deps/lib:${LD_LIBRARY_PATH} \
+    PYTHONPATH=/opt/rover/deps/lib/python3.10/site-packages:${PYTHONPATH} \
+    TORCH_CUDA_ARCH_LIST="8.7" \
+    CUDA_ARCH_BIN="8.7"
+
+SHELL ["/bin/bash", "-c"]
+
+# Set locale
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    locales \
+    curl \
+    gnupg2 \
+    lsb-release \
+    ca-certificates \
+    python3-pip \
+    python3-numpy \
+    libv4l-0 \
+    libgstreamer1.0-0 \
+    libgstreamer-plugins-base1.0-0 \
+    libusb-1.0-0 \
     libpcl-dev \
     liboctomap-dev \
     libsqlite3-dev \
     libfreenect-dev \
     libopenni2-dev \
+    && locale-gen en_US.UTF-8 \
+    && update-locale LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8 \
+    && rm -rf /var/lib/apt/lists/*
+
+# ROS2 Humble & Robotics Packages (Nav2, SLAM, Localization, Realsense Camera)
+RUN curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key -o /usr/share/keyrings/ros-archive-keyring.gpg && \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] http://packages.ros.org/ros2/ubuntu $(lsb_release -cs) main" | tee /etc/apt/sources.list.d/ros2.list > /dev/null && \
+    apt-get update && apt-get install -y --no-install-recommends \
+    ros-humble-ros-base \
+    ros-humble-navigation2 \
+    ros-humble-nav2-bringup \
+    ros-humble-slam-toolbox \
+    ros-humble-robot-localization \
+    ros-humble-realsense2-camera \
+    ros-humble-realsense2-description \
     ros-humble-cv-bridge \
     ros-humble-image-transport \
     ros-humble-tf2 \
@@ -156,92 +277,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ros-humble-grid-map-ros \
     && rm -rf /var/lib/apt/lists/*
 
-# Compile GTSAM from source for optimization support in RTAB-Map
-RUN cd /tmp && \
-    git clone --depth 1 --branch 4.2a0 https://github.com/borglab/gtsam.git gtsam && \
-    mkdir -p gtsam/build && cd gtsam/build && \
-    cmake \
-        -D CMAKE_BUILD_TYPE=Release \
-        -D CMAKE_INSTALL_PREFIX=/usr/local \
-        -D GTSAM_BUILD_WITH_MARCH_NATIVE=OFF \
-        -D GTSAM_USE_SYSTEM_EIGEN=ON \
-        -D GTSAM_BUILD_EXAMPLES_ALWAYS=OFF \
-        -D GTSAM_BUILD_TESTS=OFF \
-        .. && \
-    make -j$(nproc) && \
-    make install && \
-    ldconfig && \
-    rm -rf /tmp/gtsam
+# Copy built compiled artifacts from builder stage
+COPY --from=builder /opt/rover/deps /opt/rover/deps
+COPY --from=builder /ros2_ws /ros2_ws
 
-# Compile RTAB-Map library with CUDA support
-RUN cd /tmp && \
-    git clone --depth 1 --branch master https://github.com/introlab/rtabmap.git rtabmap && \
-    mkdir -p rtabmap/build && cd rtabmap/build && \
-    cmake \
-        -D CMAKE_BUILD_TYPE=Release \
-        -D CMAKE_INSTALL_PREFIX=/usr/local \
-        -D WITH_CUDA=ON \
-        -D CUDA_ARCH_BIN=8.7 \
-        -D WITH_QT=OFF \
-        -D WITH_PYTHON=ON \
-        -D WITH_GTSAM=ON \
-        -D WITH_OCTOMAP=ON \
-        .. && \
-    make -j$(nproc) && \
-    make install && \
-    ldconfig && \
-    rm -rf /tmp/rtabmap
-
-# Compile rtabmap_ros in ROS2 workspace
-RUN mkdir -p /ros2_ws/src && cd /ros2_ws/src && \
-    git clone --depth 1 --branch humble-devel https://github.com/introlab/rtabmap_ros.git && \
-    cd /ros2_ws && \
-    source /opt/ros/humble/setup.bash && \
-    colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release && \
-    rm -rf /ros2_ws/build /ros2_ws/log
-
-# ------------------------------------------------------------------------------
-# 5. Hardware Integration: Realsense2 SDK (librealsense2) & ROS2 wrapper (realsense2_camera)
-# Note: librealsense2 is compiled from source with RSUSB backend for ARM64/Jetson compatibility
-# and realsense2_camera / realsense2_description installed via ROS2 humble apt repos.
-# ------------------------------------------------------------------------------
-ENV REALSENSE_VERSION=2.54.2
-
-RUN cd /tmp && \
-    git clone --depth 1 --branch v${REALSENSE_VERSION} https://github.com/IntelRealSense/librealsense.git && \
-    mkdir -p librealsense/build && cd librealsense/build && \
-    cmake \
-        -D CMAKE_BUILD_TYPE=Release \
-        -D CMAKE_INSTALL_PREFIX=/usr/local \
-        -D FORCE_RSUSB_BACKEND=ON \
-        -D BUILD_PYTHON_BINDINGS:bool=true \
-        -D BUILD_EXAMPLES=OFF \
-        -D BUILD_GRAPHICAL_EXAMPLES=OFF \
-        .. && \
-    make -j$(nproc) && \
-    make install && \
-    ldconfig && \
-    rm -rf /tmp/librealsense
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ros-humble-realsense2-camera \
-    ros-humble-realsense2-description \
-    && rm -rf /var/lib/apt/lists/*
-
-# ------------------------------------------------------------------------------
-# 6. Navigation & SLAM Stack
-# ------------------------------------------------------------------------------
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ros-humble-navigation2 \
-    ros-humble-nav2-bringup \
-    ros-humble-slam-toolbox \
-    ros-humble-robot-localization \
-    && rm -rf /var/lib/apt/lists/*
-
-# ------------------------------------------------------------------------------
-# 7. Cleanup & Final Environment Configuration
-# ------------------------------------------------------------------------------
-RUN apt-get clean && \
+RUN ldconfig /opt/rover/deps/lib && \
+    apt-get clean && \
     rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
 COPY ros_entrypoint.sh /ros_entrypoint.sh
